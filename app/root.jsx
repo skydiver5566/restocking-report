@@ -1,12 +1,9 @@
 // app/root.jsx
 import React, { useMemo } from "react";
-import polaris from "@shopify/polaris";
+import { AppProvider } from "@shopify/polaris";
 import createApp from "@shopify/app-bridge";
 import { Outlet } from "react-router-dom";
 import "@shopify/polaris/build/esm/styles.css";
-
-// CommonJS destructure
-const { AppProvider } = polaris;
 
 // Context to provide App Bridge globally
 export const AppBridgeContext = React.createContext(null);
@@ -22,10 +19,8 @@ export default function App() {
     },
   };
 
-  // Create the App Bridge instance only on the client
   const appBridge = useMemo(() => {
-    if (typeof window === "undefined") return null; // prevent SSR crash
-
+    if (typeof window === "undefined") return null;
     const hostParam = new URLSearchParams(window.location.search).get("host");
     if (!hostParam) return null;
 
