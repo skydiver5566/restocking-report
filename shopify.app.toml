@@ -9,21 +9,9 @@ automatically_update_urls_on_dev = true
 [webhooks]
 api_version = "2026-01"
 
-  [[webhooks.subscriptions]]
-  topics = [ "app/uninstalled" ]
-  uri = "/webhooks/app/uninstalled"
-
-  [[webhooks.subscriptions]]
-    topics = [ "app/scopes_update" ]
-    uri = "/webhooks/app/scopes_update"
-
-  [webhooks]
-api_version = "2026-01"
-
 [[webhooks.subscriptions]]
 compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
 uri = "https://restocking-report.onrender.com/webhooks/compliance"
-
 
 [access_scopes]
 scopes = "read_orders,read_inventory,read_products,read_locations"
