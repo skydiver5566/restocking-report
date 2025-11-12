@@ -14,8 +14,20 @@ api_version = "2026-01"
   uri = "/webhooks/app/uninstalled"
 
   [[webhooks.subscriptions]]
-  topics = [ "app/scopes_update" ]
-  uri = "/webhooks/app/scopes_update"
+    topics = [ "app/scopes_update" ]
+    uri = "/webhooks/app/scopes_update"
+
+  [[webhooks.subscriptions]]
+    topics = ["customers/data_request"]
+    uri = "/webhooks/customers/data_request"
+
+  [[webhooks.subscriptions]]
+    topics = ["customers/redact"]
+    uri = "/webhooks/customers/redact"
+
+  [[webhooks.subscriptions]]
+    topics = ["shop/redact"]
+    uri = "/webhooks/shop/redact"
 
 [access_scopes]
 scopes = "read_orders,read_inventory,read_products,read_locations"
