@@ -19,22 +19,42 @@ import { authenticate } from "../shopify.server";
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
-  const startDate = formData.get("startDate");
-  const endDate = formData.get("endDate");
 
-  const shopQuery = `created_at:>=${startDate} created_at:<=${endDate}`;
+  // Keep original strings for display
+  const startDateStr = formData.get("startDate");
+  const endDateStr = formData.get("endDate");
+
+  // Parse as JS Dates (interpreted as local time on the server)
+  const startDate = new Date(startDateStr);
+  const endDate = new Date(endDateStr);
+
+  // Make endDate inclusive to the end of that minute
+  endDate.setSeconds(59, 999);
+
+  // NOTE: We do NOT use created_at in the GraphQL search query.
+  // Shopify's GraphQL Admin API does not support createdAt range filters via `query` the same way REST does.
+  // Instead, we fetch orders sorted by createdAt and filter them in JS.
   const ORDERS_QUERY = `
-    query RestockingReportOrders($query: String!, $cursor: String) {
-      orders(first: 10, query: $query, after: $cursor) {
+    query RestockingReportOrders($cursor: String) {
+      orders(
+        first: 50
+        after: $cursor
+        sortKey: CREATED_AT
+        reverse: true
+      ) {
         edges {
           cursor
           node {
             createdAt
-            lineItems(first: 10) {
+            lineItems(first: 50) {
               edges {
                 node {
                   quantity
-                  product { title vendor productType }
+                  product {
+                    title
+                    vendor
+                    productType
+                  }
                   variant {
                     title
                     sku
@@ -42,8 +62,13 @@ export const action = async ({ request }) => {
                       inventoryLevels(first: 5) {
                         edges {
                           node {
-                            quantities(names: "available") { name quantity }
-                            location { name }
+                            quantities(names: "available") {
+                              name
+                              quantity
+                            }
+                            location {
+                              name
+                            }
                           }
                         }
                       }
@@ -54,9 +79,13 @@ export const action = async ({ request }) => {
             }
           }
         }
-        pageInfo { hasNextPage endCursor }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
       }
-    }`;
+    }
+  `;
 
   let allOrders = [];
   let cursor = null;
@@ -64,22 +93,50 @@ export const action = async ({ request }) => {
 
   while (hasNextPage) {
     const response = await admin.graphql(ORDERS_QUERY, {
-      variables: { query: shopQuery, cursor },
+      variables: { cursor },
     });
+
     const data = await response.json();
-    const orders = data.data.orders.edges;
-    allOrders = allOrders.concat(orders);
-    hasNextPage = data.data.orders.pageInfo.hasNextPage;
-    cursor = data.data.orders.pageInfo.endCursor;
+
+    if (data.errors) {
+      console.error("GraphQL errors:", JSON.stringify(data.errors, null, 2));
+      break;
+    }
+
+    const ordersConnection = data?.data?.orders;
+    if (!ordersConnection) break;
+
+    const edges = ordersConnection.edges || [];
+
+    // 🔥 Filter by createdAt BETWEEN startDate and endDate (inclusive)
+    for (const edge of edges) {
+      const created = new Date(edge.node.createdAt);
+      if (created >= startDate && created <= endDate) {
+        allOrders.push(edge);
+      }
+    }
+
+    hasNextPage = ordersConnection.pageInfo.hasNextPage;
+    cursor = ordersConnection.pageInfo.endCursor;
+
+    // Safety guard so we don't go insane on very busy stores
     if (allOrders.length > 1000) break;
+
+    // Small delay for politeness towards rate limits
     await new Promise((r) => setTimeout(r, 300));
   }
+
+  /* -------------------------------------------------------------------------- */
+  /*                      BUILD ROWS FROM FILTERED ORDERS                       */
+  /* -------------------------------------------------------------------------- */
 
   const rawRows = [];
   const locationNames = new Set();
 
   for (const orderEdge of allOrders) {
-    for (const liEdge of orderEdge.node.lineItems.edges) {
+    const orderNode = orderEdge.node;
+
+    for (const liEdge of orderNode.lineItems.edges) {
       const n = liEdge.node;
       const p = n.product;
       const v = n.variant;
@@ -109,8 +166,9 @@ export const action = async ({ request }) => {
   }
 
   /* -------------------------------------------------------------------------- */
-  /*                NEW: GROUP BY PRODUCT + VARIANT + SKU                       */
+  /*                GROUP BY PRODUCT + VARIANT + SKU & SUM QTY                  */
   /* -------------------------------------------------------------------------- */
+
   const grouped = {};
 
   for (const r of rawRows) {
@@ -136,7 +194,7 @@ export const action = async ({ request }) => {
     }
   }
 
-  /* Sort alphabetically by SKU */
+  // Sort alphabetically by SKU
   const finalRows = Object.values(grouped).sort((a, b) =>
     a.sku.localeCompare(b.sku)
   );
@@ -145,8 +203,8 @@ export const action = async ({ request }) => {
     rows: finalRows,
     locationNames: Array.from(locationNames),
     timestamp: new Date().toLocaleString(),
-    startDate,
-    endDate,
+    startDate: startDateStr,
+    endDate: endDateStr,
   };
 };
 
