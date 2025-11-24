@@ -10,14 +10,18 @@ import {
   Spinner,
 } from "@shopify/polaris";
 import { useState } from "react";
-import { useActionData, useNavigation, Form } from "react-router-dom";
+import {
+  useActionData,
+  useNavigation,
+  useLoaderData,
+  Form,
+} from "react-router-dom";
 import { authenticate } from "../shopify.server";
 
 /* -------------------------------------------------------------------------- */
 /*                             Helper: TZ Mapping                             */
 /* -------------------------------------------------------------------------- */
 
-// Map Shopify Rails timezones -> IANA (US only, per your choice)
 const RAILS_TZ_TO_IANA = {
   "Eastern Time (US & Canada)": "America/New_York",
   "Central Time (US & Canada)": "America/Chicago",
@@ -25,12 +29,6 @@ const RAILS_TZ_TO_IANA = {
   "Pacific Time (US & Canada)": "America/Los_Angeles",
 };
 
-/**
- * Parse a datetime-local string (e.g. "2025-11-16T18:50")
- * and convert it from local time in `timeZone` to a UTC Date.
- *
- * This avoids relying on server local timezone and is DST-safe.
- */
 function zonedDateTimeToUtc(datetimeStr, timeZone) {
   if (!datetimeStr) return null;
 
@@ -54,11 +52,8 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
     return null;
   }
 
-  // 1) Create a "naive" UTC date from the local wall time components
   const naiveUtc = new Date(Date.UTC(year, month - 1, day, hour, minute, 0, 0));
 
-  // 2) Use Intl.DateTimeFormat to see what local time that naive UTC instant
-  //    corresponds to in the target time zone
   const dtf = new Intl.DateTimeFormat("en-US", {
     timeZone,
     year: "numeric",
@@ -78,7 +73,6 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
     }
   }
 
-  // Local time (in the given zone) that corresponds to `naiveUtc`
   const localAsIfUtcMs = Date.UTC(
     Number(map.year),
     Number(map.month) - 1,
@@ -88,27 +82,51 @@ function zonedDateTimeToUtc(datetimeStr, timeZone) {
     Number(map.second)
   );
 
-  // Offset between that zone's local time and naiveUtc
   const offsetMs = localAsIfUtcMs - naiveUtc.getTime();
-
-  // Actual UTC instant for the user-entered wall clock
   const actualUtcMs = naiveUtc.getTime() - offsetMs;
   return new Date(actualUtcMs);
 }
 
 /* -------------------------------------------------------------------------- */
+/*                               LOADER (store name)                          */
+/* -------------------------------------------------------------------------- */
+
+export async function loader({ request }) {
+  const { admin, session } = await authenticate.admin(request);
+
+  const SHOP_NAME_QUERY = `
+    query StoreName {
+      shop {
+        name
+      }
+    }
+  `;
+
+  let shopName = session.shop; // fallback to domain
+  try {
+    const resp = await admin.graphql(SHOP_NAME_QUERY);
+    const json = await resp.json();
+    if (json?.data?.shop?.name) {
+      shopName = json.data.shop.name;
+    }
+  } catch (err) {
+    console.error("Error fetching store name:", err);
+  }
+
+  return { shopName };
+}
+
+/* -------------------------------------------------------------------------- */
 /*                               SERVER ACTION                                */
 /* -------------------------------------------------------------------------- */
+
 export const action = async ({ request }) => {
   const { admin } = await authenticate.admin(request);
   const formData = await request.formData();
 
-  const startDateStr = formData.get("startDate"); // datetime-local string
+  const startDateStr = formData.get("startDate");
   const endDateStr = formData.get("endDate");
 
-  /* ------------------------------------------------------------------------ */
-  /*                      1) Fetch Store Timezone from Shopify                */
-  /* ------------------------------------------------------------------------ */
   const SHOP_TZ_QUERY = `
     query ShopTimezone {
       shop {
@@ -132,9 +150,6 @@ export const action = async ({ request }) => {
     console.error("Error fetching shop timezone:", err);
   }
 
-  /* ------------------------------------------------------------------------ */
-  /*              2) Convert user-entered local times -> UTC Dates            */
-  /* ------------------------------------------------------------------------ */
   const startUTC = zonedDateTimeToUtc(startDateStr, storeIanaTz);
   const endUTC = zonedDateTimeToUtc(endDateStr, storeIanaTz);
 
@@ -152,12 +167,8 @@ export const action = async ({ request }) => {
     };
   }
 
-  // Make end inclusive for that minute
   endUTC.setSeconds(59, 999);
 
-  /* ------------------------------------------------------------------------ */
-  /*                          3) GraphQL Orders Query                         */
-  /* ------------------------------------------------------------------------ */
   const ORDERS_QUERY = `
     query RestockingReportOrders($cursor: String) {
       orders(
@@ -202,9 +213,6 @@ export const action = async ({ request }) => {
     }
   `;
 
-  /* ------------------------------------------------------------------------ */
-  /*                 4) Pagination + Rate-Limit Safe Loop                     */
-  /* ------------------------------------------------------------------------ */
   let allOrders = [];
   let cursor = null;
   let hasNextPage = true;
@@ -214,25 +222,20 @@ export const action = async ({ request }) => {
     const response = await admin.graphql(ORDERS_QUERY, { variables: { cursor } });
     const data = await response.json();
 
-    if (data.errors) {
-      console.error("GraphQL errors:", data.errors);
-      break;
-    }
+    if (data.errors) break;
 
     const connection = data?.data?.orders;
     if (!connection) break;
 
     const edges = connection.edges || [];
 
-    // Filter orders by createdAt in UTC
     for (const edge of edges) {
-      const createdUTC = new Date(edge.node.createdAt); // Shopify returns UTC
+      const createdUTC = new Date(edge.node.createdAt);
       if (createdUTC >= startUTC && createdUTC <= endUTC) {
         allOrders.push(edge);
       }
     }
 
-    // Cost-aware throttling (avoid GraphQL "Throttled" errors)
     const cost = data.extensions?.cost;
     if (cost) {
       const remaining = cost.throttleStatus.currentlyAvailable;
@@ -240,24 +243,18 @@ export const action = async ({ request }) => {
       const restoreRate = cost.throttleStatus.restoreRate;
 
       if (remaining < requested) {
-        const wait = restoreRate * 1000;
-        console.log(`Throttled → waiting ${wait} ms`);
-        await new Promise((r) => setTimeout(r, wait));
+        await new Promise((r) => setTimeout(r, restoreRate * 1000));
       }
     }
 
     cursor = connection.pageInfo.endCursor;
     hasNextPage = connection.pageInfo.hasNextPage;
 
-    // Safety caps for live stores
     pageCount++;
-    if (pageCount > 20) break;        // max 20 pages (~1000 orders)
-    if (allOrders.length > 500) break; // enough for any small time window
+    if (pageCount > 20) break;
+    if (allOrders.length > 500) break;
   }
 
-  /* ------------------------------------------------------------------------ */
-  /*                         5) Build Raw Rows from Orders                    */
-  /* ------------------------------------------------------------------------ */
   const rawRows = [];
   const locationNames = new Set();
 
@@ -292,14 +289,9 @@ export const action = async ({ request }) => {
     }
   }
 
-  /* ------------------------------------------------------------------------ */
-  /*                  6) Group By Product + Variant + SKU                     */
-  /* ------------------------------------------------------------------------ */
   const grouped = {};
-
   for (const r of rawRows) {
     const key = `${r.productTitle}||${r.productVariantTitle}||${r.sku}`;
-
     if (!grouped[key]) {
       grouped[key] = {
         productTitle: r.productTitle,
@@ -311,7 +303,6 @@ export const action = async ({ request }) => {
         locations: {},
       };
     }
-
     grouped[key].netItemsSold += r.netItemsSold;
 
     for (const loc of Object.keys(r.locations)) {
@@ -323,9 +314,6 @@ export const action = async ({ request }) => {
     a.sku.localeCompare(b.sku)
   );
 
-  /* ------------------------------------------------------------------------ */
-  /*                                7) Return                                 */
-  /* ------------------------------------------------------------------------ */
   return {
     rows: finalRows,
     locationNames: Array.from(locationNames),
@@ -341,15 +329,19 @@ export const action = async ({ request }) => {
 /* -------------------------------------------------------------------------- */
 /*                           CLIENT-SIDE COMPONENT                            */
 /* -------------------------------------------------------------------------- */
+
 export default function RestockingReport() {
+  const { shopName } = useLoaderData();
   const data = useActionData();
   const navigation = useNavigation();
+
   const [startDate, setStartDate] = useState("");
   const [endDate, setEndDate] = useState("");
+
   const loading = navigation.state === "submitting";
 
   return (
-    <Page title="Restocking Report Wilmington">
+    <Page title={`Restocking Report (${shopName})`}>
       <style>
         {`
           table {
@@ -394,6 +386,7 @@ export default function RestockingReport() {
                     onChange={setEndDate}
                     required
                   />
+
                   <Button submit primary>
                     Run Report
                   </Button>
@@ -441,6 +434,7 @@ export default function RestockingReport() {
                         ))}
                       </tr>
                     </thead>
+
                     <tbody>
                       {data.rows.map((r, idx) => (
                         <tr key={idx}>
