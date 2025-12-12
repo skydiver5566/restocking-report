@@ -1,5 +1,5 @@
-client_id = "6a38bb4ae709a9300a1919428a55c900"
-name = "Restocking Report Chatanooga"
+client_id = "e782b0b0778fa238926f5d95475225d7"
+name = "Restocking Report Wilmington"
 application_url = "https://restocking-report-chatanooga.onrender.com"
 embedded = true
 
@@ -11,13 +11,13 @@ api_version = "2026-01"
 
 [[webhooks.subscriptions]]
 compliance_topics = ["customers/data_request", "customers/redact", "shop/redact"]
-uri = "https://restocking-report-chatanooga.onrender.com/webhooks/compliance"
+uri = "https://restocking-report-wilmington.onrender.com/webhooks/compliance"
 
 [access_scopes]
 scopes = "read_orders,read_inventory,read_products,read_locations"
 
 [auth]
 redirect_urls = [
-  "https://restocking-report-chatanooga.onrender.com/auth/callback",
-  "https://restocking-report-chatanooga.onrender.com/auth/shopify/callback"
+  "https://restocking-report-wilmington.onrender.com/auth/callback",
+  "https://restocking-report-wilmington.onrender.com/auth/shopify/callback"
 ]
